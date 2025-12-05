@@ -1,0 +1,98 @@
+#
+# 生产环境 Docker Compose 配置
+# 用于部署运营平台和后端服务到生产服务器
+#
+
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: ocpp-db-prod
+    environment:
+      - POSTGRES_USER=${DB_USER:-ocpp_user}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME:-ocpp_prod}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups
+    networks:
+      - ocppnet
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-ocpp_user} -d ${DB_NAME:-ocpp_prod}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ocpp-redis-prod
+    command: redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    volumes:
+      - redis_data:/data
+    networks:
+      - ocppnet
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  csms:
+    build:
+      context: ./csms
+      dockerfile: Dockerfile
+    container_name: ocpp-csms-prod
+    ports:
+      - "${CSMS_PORT:-9000}:9000"
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - PORT=9000
+      - DATABASE_URL=${DATABASE_URL}
+    volumes:
+      - ./logs:/var/log/csms
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ocppnet
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile.prod
+    container_name: ocpp-admin-prod
+    ports:
+      - "${ADMIN_PORT:-3000}:3000"
+    environment:
+      - NEXT_PUBLIC_CSMS_HTTP=${NEXT_PUBLIC_CSMS_HTTP:-http://localhost:9000}
+      - NODE_ENV=production
+    depends_on:
+      - csms
+    networks:
+      - ocppnet
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  ocppnet:
+    driver: bridge
+
