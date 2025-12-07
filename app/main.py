@@ -6,13 +6,15 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import redis
+
 
 # Configure logging
 logging.basicConfig(
@@ -21,9 +23,128 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ocpp_csms")
 
+# MQTT 传输支持
+try:
+    from app.ocpp.transport_manager import transport_manager, TransportType
+    from app.core.config import get_settings
+    MQTT_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"MQTT 传输不可用: {e}")
+    MQTT_AVAILABLE = False
+
+# 历史记录支持
+try:
+    from app.utils.history_recorder import (
+        record_heartbeat, 
+        record_status_change, 
+        get_last_heartbeat_time,
+        get_last_status
+    )
+    HISTORY_RECORDING_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"历史记录功能不可用: {e}")
+    HISTORY_RECORDING_AVAILABLE = False
+
+# 数据库支持
+try:
+    from app.database import init_db, check_db_health, SessionLocal, Charger
+    from datetime import datetime, timezone as tz
+    DATABASE_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"数据库功能不可用: {e}")
+    DATABASE_AVAILABLE = False
+
+
+# ---- 生命周期管理 ----
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理，初始化多种传输方式（MQTT、HTTP、WebSocket）"""
+    # 启动时
+    # 初始化数据库
+    if DATABASE_AVAILABLE:
+        try:
+            if check_db_health():
+                init_db()
+                logger.info("数据库表已初始化")
+            else:
+                logger.warning("数据库连接失败，跳过表初始化")
+        except Exception as e:
+            logger.error(f"数据库初始化失败: {e}", exc_info=True)
+    
+    if MQTT_AVAILABLE:
+        try:
+            settings = get_settings()
+            
+            # 准备启用的传输方式列表
+            enabled_transports = []
+            
+            # 检查并配置 MQTT
+            if settings.enable_mqtt_transport:
+                enabled_transports.append(TransportType.MQTT)
+                # 在 Docker 容器中，优先使用环境变量，否则使用 mqtt-broker（Docker 服务名）
+                mqtt_host = os.getenv("MQTT_BROKER_HOST")
+                if not mqtt_host:
+                    # 检查是否在 Docker 网络中（通过检查是否能解析 mqtt-broker）
+                    try:
+                        import socket
+                        socket.gethostbyname("mqtt-broker")
+                        mqtt_host = "mqtt-broker"
+                        logger.info("检测到 Docker 网络，使用 mqtt-broker 作为 MQTT broker 地址")
+                    except:
+                        mqtt_host = settings.mqtt_broker_host or "localhost"
+                
+                # 如果检测到 Docker 网络，临时修改配置
+                if mqtt_host != settings.mqtt_broker_host:
+                    # 直接修改 settings 对象（因为它是单例）
+                    settings.mqtt_broker_host = mqtt_host
+            
+            # 检查并配置 HTTP（可通过环境变量 ENABLE_HTTP_TRANSPORT 启用）
+            # 环境变量优先级高于配置文件
+            enable_http = os.getenv("ENABLE_HTTP_TRANSPORT", "").lower() in ("true", "1", "yes")
+            if enable_http or settings.enable_http_transport:
+                enabled_transports.append(TransportType.HTTP)
+                logger.info("HTTP 传输已启用（通过环境变量或配置）")
+            
+            # 检查并配置 WebSocket（可通过环境变量 ENABLE_WEBSOCKET_TRANSPORT 启用）
+            # 环境变量优先级高于配置文件
+            enable_ws = os.getenv("ENABLE_WEBSOCKET_TRANSPORT", "").lower() in ("true", "1", "yes")
+            if enable_ws or settings.enable_websocket_transport:
+                enabled_transports.append(TransportType.WEBSOCKET)
+                logger.info("WebSocket 传输已启用（通过环境变量或配置）")
+            
+            # 初始化传输管理器
+            if enabled_transports:
+                # 先初始化传输管理器
+                await transport_manager.initialize(enabled_transports)
+                # 然后设置消息处理器（确保所有适配器都已创建）
+                transport_manager.set_message_handler(handle_ocpp_message)
+                logger.info(f"传输管理器已初始化，启用了 {len(enabled_transports)} 种传输方式: {[t.value for t in enabled_transports]}")
+                # 验证消息处理器已设置
+                for transport_type, adapter in transport_manager.adapters.items():
+                    if adapter.message_handler:
+                        logger.info(f"{transport_type.value} 适配器消息处理器已设置")
+                    else:
+                        logger.warning(f"{transport_type.value} 适配器消息处理器未设置")
+        except Exception as e:
+            logger.error(f"传输管理器初始化失败: {e}", exc_info=True)
+            # 不阻止应用启动，只是某些传输方式不可用
+    
+    yield
+    
+    # 关闭时
+    if MQTT_AVAILABLE:
+        try:
+            await transport_manager.shutdown()
+            logger.info("传输管理器已关闭")
+        except Exception as e:
+            logger.error(f"关闭传输管理器时出错: {e}", exc_info=True)
+
 
 # ---- App & CORS ----
-app = FastAPI(title="Local OCPP 1.6J CSMS")
+app = FastAPI(
+    title="Local OCPP 1.6J CSMS",
+    lifespan=lifespan
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,6 +164,191 @@ ORDERS_HASH_KEY = "orders"  # Redis hash for charging orders
 
 # ---- WebSocket connection registry ----
 charger_websockets: Dict[str, WebSocket] = {}
+
+
+# ---- 统一的 OCPP 消息处理函数（供 MQTT 和 WebSocket 使用）----
+async def handle_ocpp_message(charger_id: str, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """统一的 OCPP 消息处理函数"""
+    charger = next((c for c in load_chargers() if c["id"] == charger_id), get_default_charger(charger_id))
+    charger["last_seen"] = now_iso()
+    
+    # 处理不同的 OCPP 消息
+    if action == "BootNotification":
+        try:
+            charger["status"] = "Available"
+            vendor = str(payload.get("vendor", ""))
+            model = str(payload.get("model", ""))
+            firmware_version = str(payload.get("firmwareVersion", ""))
+            serial_number = str(payload.get("serialNumber", ""))
+            
+            charger["vendor"] = vendor if vendor else charger.get("vendor")
+            charger["model"] = model if model else charger.get("model")
+            charger["firmware_version"] = firmware_version if firmware_version else charger.get("firmware_version")
+            charger["serial_number"] = serial_number if serial_number else charger.get("serial_number")
+            
+            update_active(charger_id, vendor=vendor or None, model=model or None, status="Available")
+            save_charger(charger)
+            
+            logger.info(f"[{charger_id}] BootNotification: vendor={vendor}, model={model}")
+            
+            return {
+                "status": "Accepted",
+                "currentTime": now_iso(),
+                "interval": 30,
+            }
+        except Exception as e:
+            logger.error(f"[{charger_id}] BootNotification处理错误: {e}", exc_info=True)
+            return {"status": "Rejected", "error": str(e)}
+    
+    elif action == "Heartbeat":
+        update_active(charger_id)
+        save_charger(charger)
+        
+        # 记录心跳历史
+        if HISTORY_RECORDING_AVAILABLE:
+            try:
+                previous_heartbeat_time = get_last_heartbeat_time(charger_id)
+                record_heartbeat(charger_id, previous_heartbeat_time)
+            except Exception as e:
+                logger.error(f"[{charger_id}] 记录心跳历史失败: {e}", exc_info=True)
+        
+        return {"currentTime": now_iso()}
+    
+    elif action == "StatusNotification":
+        new_status = str(payload.get("status", "Unknown"))
+        previous_status = charger.get("status")
+        charger["status"] = new_status
+        if new_status == "Available":
+            session = charger.setdefault("session", {
+                "authorized": False,
+                "transaction_id": None,
+                "meter": 0,
+            })
+            if session.get("transaction_id") is not None:
+                session["transaction_id"] = None
+                session["order_id"] = None
+        update_active(charger_id, status=new_status)
+        save_charger(charger)
+        
+        # 记录状态变化历史
+        if HISTORY_RECORDING_AVAILABLE and previous_status != new_status:
+            try:
+                record_status_change(charger_id, new_status, previous_status)
+            except Exception as e:
+                logger.error(f"[{charger_id}] 记录状态历史失败: {e}", exc_info=True)
+        
+        return {}
+    
+    elif action == "Authorize":
+        id_tag = str(payload.get("idTag", ""))
+        charger["session"]["authorized"] = True if id_tag else False
+        save_charger(charger)
+        auth_status = "Accepted" if id_tag else "Invalid"
+        return {"idTagInfo": {"status": auth_status}}
+    
+    elif action == "StartTransaction":
+        tx_id = payload.get("transactionId") or int(datetime.now().timestamp())
+        id_tag = str(payload.get("idTag", ""))
+        charger["session"]["transaction_id"] = tx_id
+        charger["status"] = "Charging"
+        
+        charging_rate = charger.get("charging_rate", 7.0)
+        order_id = f"order_{tx_id}"
+        start_time = now_iso()
+        create_order(
+            order_id=order_id,
+            charger_id=charger_id,
+            user_id=id_tag,
+            id_tag=id_tag,
+            charging_rate=charging_rate,
+            start_time=start_time,
+        )
+        charger["session"]["order_id"] = order_id
+        
+        update_active(charger_id, status="Charging", txn_id=tx_id)
+        save_charger(charger)
+        
+        return {
+            "transactionId": tx_id,
+            "idTagInfo": {"status": "Accepted"},
+        }
+    
+    elif action == "MeterValues":
+        # 处理 MeterValues 消息，提取电量数据
+        meter_value = payload.get("meterValue", [])
+        if meter_value:
+            # 取第一个 meterValue 中的 sampledValue
+            sampled_values = meter_value[0].get("sampledValue", [])
+            if sampled_values:
+                # 查找 Energy.Active.Import.Register 类型的值
+                energy_value = None
+                for sv in sampled_values:
+                    if sv.get("measurand") == "Energy.Active.Import.Register":
+                        energy_value = sv.get("value")
+                        break
+                
+                # 如果找到了能量值，更新充电桩的meter值
+                if energy_value is not None:
+                    try:
+                        meter_wh = int(float(energy_value))  # 转换为整数（Wh）
+                        charger["session"]["meter"] = meter_wh
+                        save_charger(charger)
+                        logger.info(f"[{charger_id}] MeterValues: 更新电量 = {meter_wh} Wh ({meter_wh/1000.0:.2f} kWh)")
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"[{charger_id}] MeterValues: 无法解析电量值 {energy_value}: {e}")
+        return {}
+    
+    elif action == "StopTransaction":
+        tx_id = charger["session"].get("transaction_id")
+        order_id = charger["session"].get("order_id")
+        
+        if order_id:
+            order = get_order(order_id)
+            if order and order.get("status") == "ongoing":
+                start_time_str = order.get("start_time")
+                end_time_str = now_iso()
+                
+                start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                duration_seconds = (end_time - start_time).total_seconds()
+                duration_minutes = duration_seconds / 60.0
+                
+                charging_rate = order.get("charging_rate", 7.0)
+                energy_kwh = charging_rate * (duration_minutes / 60.0)
+                
+                update_order(
+                    order_id=order_id,
+                    end_time=end_time_str,
+                    duration_minutes=round(duration_minutes, 2),
+                    energy_kwh=round(energy_kwh, 2),
+                )
+        
+        charger["session"]["transaction_id"] = None
+        charger["session"]["order_id"] = None
+        charger["status"] = "Available"
+        update_active(charger_id, status="Available", txn_id=None)
+        save_charger(charger)
+        
+        return {
+            "stopped": True,
+            "transactionId": tx_id,
+            "idTagInfo": {"status": "Accepted"},
+        }
+    
+    elif action in ["FirmwareStatusNotification", "DiagnosticsStatusNotification"]:
+        save_charger(charger)
+        return {}
+    
+    elif action == "DataTransfer":
+        save_charger(charger)
+        return {
+            "status": "Accepted",
+            "data": None
+        }
+    
+    else:
+        logger.warning(f"[{charger_id}] 未知的 OCPP 动作: {action}")
+        return {"error": "UnknownAction", "action": action}
 
 
 # ---- Helper function to send OCPP messages from CSMS to Charge Point ----
@@ -158,6 +464,76 @@ def save_charger(charger: Dict[str, Any]) -> None:
         # 其他Redis错误，记录但不中断流程
         logger.error(f"Redis错误，无法保存充电桩 {charger['id']}: {e}", exc_info=True)
         logger.warning(f"充电桩数据未保存到Redis，但连接继续: {charger['id']}")
+    
+    # 同步到数据库
+    if DATABASE_AVAILABLE:
+        try:
+            sync_charger_to_db(charger)
+        except Exception as e:
+            logger.error(f"同步充电桩 {charger['id']} 到数据库失败: {e}", exc_info=True)
+
+
+def sync_charger_to_db(charger: Dict[str, Any]) -> None:
+    """将充电桩数据同步到数据库"""
+    if not DATABASE_AVAILABLE:
+        return
+    
+    try:
+        db = SessionLocal()
+        try:
+            charger_id = charger["id"]
+            # 查找或创建充电桩记录
+            db_charger = db.query(Charger).filter(Charger.id == charger_id).first()
+            
+            if not db_charger:
+                # 创建新记录
+                db_charger = Charger(id=charger_id)
+                db.add(db_charger)
+            
+            # 更新字段
+            if "vendor" in charger:
+                db_charger.vendor = charger.get("vendor")
+            if "model" in charger:
+                db_charger.model = charger.get("model")
+            if "firmware_version" in charger:
+                db_charger.firmware_version = charger.get("firmware_version")
+            if "serial_number" in charger:
+                db_charger.serial_number = charger.get("serial_number")
+            if "status" in charger:
+                db_charger.status = charger.get("status", "Unknown")
+            if "last_seen" in charger:
+                try:
+                    db_charger.last_seen = datetime.fromisoformat(charger["last_seen"].replace("Z", "+00:00"))
+                except:
+                    db_charger.last_seen = datetime.now(tz.utc)
+            
+            # 更新位置信息
+            if "location" in charger:
+                loc = charger["location"]
+                if isinstance(loc, dict):
+                    db_charger.latitude = loc.get("latitude")
+                    db_charger.longitude = loc.get("longitude")
+                    db_charger.address = loc.get("address")
+            
+            # 更新配置信息
+            if "connector_type" in charger:
+                db_charger.connector_type = charger.get("connector_type", "Type2")
+            if "charging_rate" in charger:
+                db_charger.charging_rate = charger.get("charging_rate", 7.0)
+            if "price_per_kwh" in charger:
+                db_charger.price_per_kwh = charger.get("price_per_kwh", 2700.0)
+            
+            db_charger.is_active = True
+            db_charger.updated_at = datetime.now(tz.utc)
+            
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"同步充电桩 {charger.get('id', 'unknown')} 到数据库失败: {e}", exc_info=True)
 
 
 # ---- Order Management ----
@@ -1180,6 +1556,96 @@ def get_current_order(chargePointId: str = Query(...), transactionId: int | None
         return charger_orders[0]
     
     raise HTTPException(status_code=404, detail="No order found")
+
+
+@app.get("/api/orders/current/meter", tags=["REST"])
+def get_current_order_meter(
+    chargePointId: str = Query(...), 
+    transactionId: int | None = Query(None)
+) -> Dict[str, Any]:
+    """
+    获取当前充电订单的实时电量数据
+    返回最新的 MeterValues 数据，用于实时显示电量和费用
+    """
+    charger = next((c for c in load_chargers() if c["id"] == chargePointId), None)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+    
+    session = charger.get("session", {})
+    current_transaction_id = session.get("transaction_id")
+    
+    # 如果没有提供transactionId，使用充电桩当前的事务ID
+    if not transactionId:
+        transactionId = current_transaction_id
+    
+    if not transactionId:
+        raise HTTPException(status_code=404, detail="No active transaction")
+    
+    # 获取当前电量（Wh），从充电桩的session中获取
+    meter_value_wh = session.get("meter", 0)
+    
+    # 转换为 kWh
+    meter_value_kwh = meter_value_wh / 1000.0
+    
+    # 获取订单信息
+    order_id = session.get("order_id") or f"order_{transactionId}"
+    order = get_order(order_id)
+    
+    # 计算费用
+    price_per_kwh = charger.get("price_per_kwh", 2700.0)  # COP/kWh
+    total_cost = meter_value_kwh * price_per_kwh
+    
+    # 计算充电时长（如果有订单）
+    duration_minutes = None
+    if order and order.get("start_time"):
+        try:
+            start_time = datetime.fromisoformat(order["start_time"].replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            duration_minutes = (now - start_time).total_seconds() / 60.0
+        except:
+            pass
+    
+    return {
+        "charger_id": chargePointId,
+        "transaction_id": transactionId,
+        "meter_value_wh": meter_value_wh,
+        "meter_value_kwh": round(meter_value_kwh, 3),
+        "price_per_kwh": price_per_kwh,
+        "total_cost": round(total_cost, 2),
+        "duration_minutes": round(duration_minutes, 1) if duration_minutes else None,
+        "timestamp": now_iso(),
+        "order_id": order_id if order else None,
+    }
+
+
+# ---- HTTP OCPP 端点（如果启用 HTTP 传输）----
+@app.post("/ocpp/{charger_id}", tags=["OCPP"])
+@app.get("/ocpp/{charger_id}", tags=["OCPP"])
+async def ocpp_http(charger_id: str, request: Request):
+    """
+    HTTP OCPP 端点
+    - POST: 充电桩发送 OCPP 消息
+    - GET: 充电桩轮询获取待处理的 CSMS 消息
+    """
+    if not MQTT_AVAILABLE or not hasattr(transport_manager, 'adapters'):
+        raise HTTPException(status_code=503, detail="传输管理器未初始化")
+    
+    settings = get_settings()
+    if not settings.enable_http_transport:
+        raise HTTPException(status_code=503, detail="HTTP 传输未启用")
+    
+    # 获取 HTTP 适配器
+    http_adapter = transport_manager.get_adapter(TransportType.HTTP)
+    if not http_adapter:
+        raise HTTPException(status_code=503, detail="HTTP 传输适配器不可用")
+    
+    try:
+        return await http_adapter.handle_http_request(charger_id, request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{charger_id}] HTTP OCPP 请求处理错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.websocket("/ocpp")

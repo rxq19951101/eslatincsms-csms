@@ -218,3 +218,49 @@ class OCPPErrorLog(Base):
         Index('idx_error_logs_timestamp', 'timestamp'),
         Index('idx_error_logs_charger_id', 'charger_id'),
     )
+
+
+class HeartbeatHistory(Base):
+    """心跳历史记录"""
+    __tablename__ = "heartbeat_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    charger_id = Column(String(100), nullable=False, index=True)
+    
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+    
+    # 健康状态：基于心跳间隔计算
+    # 正常：心跳间隔 <= 35秒
+    # 警告：心跳间隔 35-60秒
+    # 异常：心跳间隔 > 60秒或丢失
+    health_status = Column(String(20), default="normal")  # normal, warning, abnormal
+    
+    # 心跳间隔（秒）
+    interval_seconds = Column(Float, nullable=True)
+    
+    __table_args__ = (
+        Index('idx_heartbeat_charger_timestamp', 'charger_id', 'timestamp'),
+        Index('idx_heartbeat_timestamp', 'timestamp'),
+    )
+
+
+class StatusHistory(Base):
+    """状态变化历史记录"""
+    __tablename__ = "status_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    charger_id = Column(String(100), nullable=False, index=True)
+    
+    status = Column(String(50), nullable=False)  # Available, Charging, Offline, Faulted, Unavailable
+    previous_status = Column(String(50), nullable=True)
+    
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+    
+    # 状态持续时间（秒），用于统计
+    duration_seconds = Column(Float, nullable=True)
+    
+    __table_args__ = (
+        Index('idx_status_charger_timestamp', 'charger_id', 'timestamp'),
+        Index('idx_status_timestamp', 'timestamp'),
+        Index('idx_status_charger_status', 'charger_id', 'status'),
+    )

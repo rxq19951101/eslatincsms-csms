@@ -3,9 +3,10 @@
 # 提供充电桩的CRUD操作
 #
 
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from app.database import get_db, Charger
 from app.core.logging_config import get_logger
 
@@ -15,11 +16,49 @@ router = APIRouter()
 
 
 @router.get("", summary="获取所有充电桩")
-def list_chargers(db: Session = Depends(get_db)) -> List[dict]:
-    """获取所有充电桩列表"""
-    chargers = db.query(Charger).filter(Charger.is_active == True).all()
-    return [
-        {
+def list_chargers(
+    filter_type: Optional[str] = Query(None, description="筛选类型: configured(已配置), unconfigured(未配置)"),
+    db: Session = Depends(get_db)
+) -> List[dict]:
+    """
+    获取充电桩列表
+    
+    支持筛选：
+    - configured: 只返回已配置的充电桩（有位置和价格）
+    - unconfigured: 只返回未配置的充电桩（缺少位置或价格）
+    """
+    query = db.query(Charger).filter(Charger.is_active == True)
+    
+    # 根据筛选类型过滤
+    if filter_type == "configured":
+        # 已配置：有位置和价格
+        query = query.filter(
+            Charger.latitude.isnot(None),
+            Charger.longitude.isnot(None),
+            Charger.price_per_kwh.isnot(None),
+            Charger.price_per_kwh > 0
+        )
+    elif filter_type == "unconfigured":
+        # 未配置：缺少位置或价格
+        query = query.filter(
+            or_(
+                Charger.latitude.is_(None),
+                Charger.longitude.is_(None),
+                Charger.price_per_kwh.is_(None),
+                Charger.price_per_kwh == 0
+            )
+        )
+    
+    chargers = query.all()
+    
+    result = []
+    for c in chargers:
+        # 判断配置状态
+        has_location = c.latitude is not None and c.longitude is not None
+        has_pricing = c.price_per_kwh is not None and c.price_per_kwh > 0
+        is_configured = has_location and has_pricing
+        
+        result.append({
             "id": c.id,
             "vendor": c.vendor,
             "model": c.model,
@@ -33,9 +72,12 @@ def list_chargers(db: Session = Depends(get_db)) -> List[dict]:
             "connector_type": c.connector_type,
             "charging_rate": c.charging_rate,
             "price_per_kwh": c.price_per_kwh,
-        }
-        for c in chargers
-    ]
+            "is_configured": is_configured,
+            "has_location": has_location,
+            "has_pricing": has_pricing,
+        })
+    
+    return result
 
 
 @router.get("/{charger_id}", summary="获取充电桩详情")

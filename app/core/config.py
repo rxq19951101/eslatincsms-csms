@@ -56,10 +56,10 @@ class Settings(BaseSettings):
     ws_ping_interval: int = 20
     ws_ping_timeout: int = 10
     ws_max_connections: int = 1000
-    enable_websocket_transport: bool = True  # 是否启用 WebSocket 传输（默认启用以保持向后兼容）
+    enable_websocket_transport: bool = False  # 是否启用 WebSocket 传输（默认关闭，可通过环境变量启用）
     
     # HTTP传输配置
-    enable_http_transport: bool = False  # 是否启用 HTTP 传输
+    enable_http_transport: bool = False  # 是否启用 HTTP 传输（默认关闭，可通过环境变量启用）
     http_ocpp_endpoint: str = "/ocpp"  # HTTP OCPP 端点前缀
     
     # MQTT传输配置（默认通信模式）

@@ -42,11 +42,11 @@ class TransportManager:
             return
         
         if enabled_transports is None:
-            # 根据配置自动选择启用的传输方式（MQTT 作为默认）
+            # 根据配置自动选择启用的传输方式（MQTT 作为默认，仅启用 MQTT）
             enabled_transports = [TransportType.MQTT]  # MQTT 默认启用
             
-            # 只在配置启用时才添加其他传输方式
-            if getattr(self.settings, 'enable_websocket_transport', True):  # WebSocket 默认也启用（向后兼容）
+            # 只在配置启用时才添加其他传输方式（默认不启用）
+            if getattr(self.settings, 'enable_websocket_transport', False):
                 enabled_transports.append(TransportType.WEBSOCKET)
             
             if getattr(self.settings, 'enable_http_transport', False):
@@ -100,8 +100,9 @@ class TransportManager:
     
     def set_message_handler(self, handler):
         """为所有适配器设置消息处理器"""
-        for adapter in self.adapters.values():
+        for transport_type, adapter in self.adapters.items():
             adapter.set_message_handler(handler)
+            logger.debug(f"{transport_type.value} 适配器已设置消息处理器")
     
     async def send_message(
         self,

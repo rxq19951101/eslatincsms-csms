@@ -107,11 +107,14 @@ class MQTTAdapter(TransportAdapter):
                 self._connected_chargers.add(charger_id)
                 
                 # 异步处理消息（在事件循环中）
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(self._handle_message(charger_id, action, payload_data))
+                # 注意：_on_message 在 paho-mqtt 的后台线程中执行，需要使用 run_coroutine_threadsafe
+                if self._loop and self._loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_message(charger_id, action, payload_data),
+                        self._loop
+                    )
                 else:
-                    loop.run_until_complete(self._handle_message(charger_id, action, payload_data))
+                    logger.warning(f"[{charger_id}] 事件循环不可用，无法处理 MQTT 消息")
             else:
                 logger.warning(f"未知的消息类型: {message_type}")
                 
